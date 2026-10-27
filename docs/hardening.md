@@ -12,6 +12,68 @@ from a real audit. tattle reports on most of these but does not change them.
   and set it as `HEARTBEAT_URL`. If the worker is deleted, that check alerts.
 - Run the weekly analyzer somewhere that is not your most-privileged machine.
 
+## Deployment controls the code cannot establish
+
+- Keep deployment credentials, the read token and global canary key off monitored
+  machines. Protect the operator's secrets file and private deployment directory;
+  the secrets file is executable shell configuration. Use `npm ci` and the pinned
+  `worker/node_modules/.bin/wrangler`, then deploy through `bin/tattle` so private
+  configuration is copied only into a unique, cleaned temporary config.
+- Keep the `HOST_GATE` Durable Object binding and migration in your private
+  `wrangler.toml`. The gate supplies strict per-host admission, durable report
+  recovery and bounded canary enrollment through one host-named coordinator. It
+  durably tracks the active token hash, atomically resets local state on rotation
+  and permanently retires old hashes. KV alone cannot supply serialization.
+- Configure and verify the R2 retention lock and lifecycle independently. Worker
+  code uses stable keys and conditional create and has no archive-delete route;
+  an account owner or stolen deployment credential has broader authority unless
+  storage retention rules constrain it.
+- Protect DNS, Cloudflare account access and HTTPS deployment authority. Installer
+  path checks do not authenticate the intent of code served by a compromised
+  deployment. Optional signed releases and independently verified provenance add
+  another distribution control; this repository does not supply that verification.
+- Prefer `--prompt-token` for installation. Legacy positional tokens can be saved
+  in shell history and sudo logs. A host token can submit that host's reports and
+  request its bounded canary planting script; it cannot retrieve archives. New
+  canary callbacks are bound to the host and active token hash; revocation or
+  re-enrollment invalidates the old callback key. Legacy global-key callbacks still
+  work, so protect the global key and plan migration before rotating it.
+
+## Collector and enrollment safeguards
+
+The installer validates root ownership, modes, ACLs and nonsymlink destination
+ancestry before privileged writes, uses a system-only PATH, and atomically
+publishes unique temporary files. It refuses unsafe existing paths rather than
+repairing them into trusted paths. The collector checks resolved optional-tool
+paths, bounds each section's time and output, and encodes path evidence. Review
+reported timeouts/truncation: bounded collection can omit evidence, and root can
+still forge collection output.
+
+Enrollment creates persistent, token-hash-tagged `expected/<host>` state so a
+machine that never reports still alerts after the grace period. Ingest retains
+that marker. Sweeps write `silence/<host>/<hash>` receipts without rewriting
+shared expected/seen state. Add/remove operations use a lock and recovery
+journal; retry a failed operation to finish rollback or cleanup. Removal revokes
+the host token and clears expected/seen/baseline views while retaining archived
+reports. Report ingestion, canary planting, status, report retrieval, alerting and
+silence checks remain available alongside macOS/Linux collection, `--print`,
+launchd, systemd and cron scheduling. See [the design](design.md) for exact request
+limits, pagination and recovery behavior.
+
+Upgrades automatically initialize a fresh silence grace period for legacy hosts
+with no seen or enrollment state, using immutable token-scoped bootstrap markers
+instead of changing existing baselines. The sweep covers 500 hosts per run.
+Original complete reader envelopes remain the default within resource bounds;
+larger readers opt into `pagination=1` and follow cursors. Deploy validates TOML
+and bundles locally before remote recovery or deployment writes. The operator
+needs Python 3.11 or newer for preflight.
+
+Use installer `--refresh-canaries` after re-enrollment to replace recognized
+Tattle blocks while preserving other profiles and entries. Replaced files have
+private backups. Refresh fails closed on unsafe links and ambiguous ownership,
+including legacy unmarked `prod-secrets.env`: inspect and move only the known old
+canary aside before retrying. Ordinary installs remain idempotent.
+
 ## Laptops
 
 - **FileVault on.** `fdesetup status` is the source of truth. Apple-silicon

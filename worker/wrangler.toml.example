@@ -26,3 +26,13 @@ id = "<kv namespace id>"
 type = "Text"
 globs = ["**/tattle-collect", "**/*.sh"]
 fallthrough = true
+
+# Required: strict per-host admission. KV remains a read/silence-sweep view.
+# Deploy this migration with the binding before accepting reports/provisioning.
+[[durable_objects.bindings]]
+name = "HOST_GATE"
+class_name = "HostGate"
+
+[[migrations]]
+tag = "v1-host-gate"
+new_sqlite_classes = ["HostGate"]

@@ -6,16 +6,22 @@ const ALERT_ON_ANY_CHANGE = ["posture"];
 // Returns human-readable lines describing the changes worth alerting on.
 export function diffSections(before, after) {
 	const out = [];
-	const lines = (s) => new Set(String(s || "").split("\n").filter(Boolean));
+	// Legacy snapshots can contain arbitrary JSON values. Never coerce them:
+	// coercion can execute user-defined toString/valueOf methods.
+	const field = (sections, name) => {
+		try { return sections?.[name]; } catch { return undefined; }
+	};
+	const lines = (s) => new Set(typeof s === "string" ? s.split("\n").map((line) => line.trim()).filter(Boolean) : []);
 
 	for (const name of ALERT_ON_ADD) {
-		const old = lines(before[name]);
-		for (const line of lines(after[name])) if (!old.has(line)) out.push(`+ ${name}: ${line}`);
+		const old = lines(field(before, name));
+		for (const line of lines(field(after, name))) if (!old.has(line)) out.push(`+ ${name}: ${line}`);
 	}
 	for (const name of ALERT_ON_ANY_CHANGE) {
-		const old = lines(before[name]);
-		const cur = lines(after[name]);
+		const old = lines(field(before, name));
+		const cur = lines(field(after, name));
 		for (const line of cur) if (!old.has(line)) out.push(`~ ${name}: ${line}`);
+		for (const line of old) if (!cur.has(line)) out.push(`- ${name}: ${line}`);
 	}
 
 	// Listening sockets: ports on loopback and ephemeral ports churn constantly.
@@ -32,8 +38,8 @@ export function diffSections(before, after) {
 		}
 		return set;
 	};
-	const oldExposed = exposed(before.listening);
-	for (const proc of exposed(after.listening)) {
+	const oldExposed = exposed(field(before, "listening"));
+	for (const proc of exposed(field(after, "listening"))) {
 		if (!oldExposed.has(proc)) out.push(`+ listening: ${proc} now accepts connections from the network`);
 	}
 	return out;

@@ -3,42 +3,260 @@
 #
 #   tattle init                 create secrets (read token, canary key, ntfy topic)
 #   tattle deploy               deploy the worker with the current host list
-#   tattle add-host NAME        mint a host token, print the install command
+#   tattle add-host NAME        mint a host token, print installation instructions
 #   tattle remove-host NAME     revoke a host's token
 #   tattle status               last report time for every host
 #   tattle test-alert           send a test notification through the worker's ntfy topic
 #
-# State lives in two places, deliberately apart:
-#   $TATTLE_DEPLOY  (a private git repo)  wrangler.toml, hosts.json (token hashes only)
-#   $TATTLE_SECRETS (default ~/.config/tattle/secrets.env, mode 600, never committed)
+# TATTLE_DEPLOY is a private deployment directory. TATTLE_SECRETS is trusted
+# shell configuration (default ~/.config/tattle/secrets.env).
 set -eu
-
+umask 077
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEPLOY=${TATTLE_DEPLOY:?set TATTLE_DEPLOY to your private deployment directory}
 SECRETS=${TATTLE_SECRETS:-$HOME/.config/tattle/secrets.env}
-WRANGLER=${WRANGLER:-npx wrangler}
+WRANGLER=${WRANGLER:-$ROOT/worker/node_modules/.bin/wrangler}
 HOSTS="$DEPLOY/hosts.json"
+PENDING="$DEPLOY/.tattle-pending.json"
+LOCK="$DEPLOY/.tattle-lock"
 
 die() { echo "tattle: $*" >&2; exit 1; }
 rand() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 sha() { printf %s "$1" | shasum -a 256 | cut -d' ' -f1; }
-load() { [ -r "$SECRETS" ] || die "no $SECRETS; run tattle init"; . "$SECRETS"; }
-wr() { (cd "$ROOT/worker" && cp "$DEPLOY/wrangler.toml" wrangler.toml && $WRANGLER "$@"); }
 
-hosts_json() {
-	# hosts.json: {"name": "sha256", ...}  ->  secret: {"sha256": "name", ...}
-	python3 -c 'import json,sys; print(json.dumps({v: k for k, v in json.load(open(sys.argv[1])).items()}))' "$HOSTS"
+# Keep filesystem writes in one implementation: same-directory temporary files,
+# fsync before replace, and fsync the containing directory after each mutation.
+py() {
+	py_action=$1
+	shift
+	python3 -c '
+import datetime, json, os, pathlib, re, stat, subprocess, sys, tempfile
+act, deploy, secrets, *args = sys.argv[1:]
+d = pathlib.Path(deploy)
+hosts, pending = d / "hosts.json", d / ".tattle-pending.json"
+def check(p, directory=False, optional=False):
+    if not p.is_absolute(): raise ValueError(f"path must be absolute: {p}")
+    for component in [*reversed(p.parents), p]:
+        if component.is_symlink(): raise ValueError(f"symlink path refused: {component}")
+    if optional and not p.exists(): return
+    s = p.stat()
+    if s.st_uid != os.getuid(): raise ValueError(f"path must be owned by current user: {p}")
+    if directory:
+        if not stat.S_ISDIR(s.st_mode) or s.st_mode & 0o022:
+            raise ValueError(f"directory must not be writable by other users: {p}")
+    else:
+        if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1: raise ValueError(f"expected private regular file: {p}")
+        os.chmod(p, 0o600)
+def syncdir():
+    fd = os.open(d, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+def write(p, value):
+    check(p, optional=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tattle-write-", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f, indent=2, sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, p); syncdir()
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+def valid_name(name):
+    return isinstance(name, str) and 1 <= len(name) <= 128 and name not in {"constructor", "prototype", "__proto__"} and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", name)
+def validate_hosts(value):
+    if not isinstance(value, dict) or len(value) > 10000:
+        raise ValueError("host map must contain at most 10000 hosts")
+    if any(not valid_name(k) or not isinstance(v, str) or not re.fullmatch(r"[a-f0-9]{64}", v) for k,v in value.items()):
+        raise ValueError("host map must map valid lowercase host names (1-128 characters, no prototype names) to SHA-256 token hashes")
+    if len(set(value.values())) != len(value): raise ValueError("host token hashes must be unique")
+    return value
+def readhosts(): return validate_hosts(json.loads(hosts.read_text()))
+def readpending():
+    value = json.loads(pending.read_text())
+    if not isinstance(value, dict) or value.get("op") not in {"add", "remove"} or not valid_name(value.get("name")):
+        raise ValueError("invalid pending host operation")
+    validate_hosts(value.get("old")); validate_hosts(value.get("target"))
+    return value
+
+try:
+    if act == "paths":
+        check(d, directory=True)
+        check(pathlib.Path(secrets).parent, directory=True)
+        check(pathlib.Path(secrets), optional=True)
+        check(d / "wrangler.toml", optional=True)
+        check(hosts, optional=True); check(pending, optional=True)
+        if hosts.exists(): readhosts()
+        if pending.exists(): readpending()
+    elif act == "validate-name":
+        if not valid_name(args[0]): raise ValueError("host names must be 1-128 lowercase letters, digits, dots or dashes; prototype names are reserved")
+    elif act == "init-hosts":
+        if not hosts.exists(): write(hosts, {})
+    elif act == "map":
+        value = readhosts() if not args else validate_hosts(readpending()[args[0]])
+        print(json.dumps({v:k for k,v in value.items()}))
+    elif act == "begin":
+        operation, name, *digest = args
+        if operation not in {"add", "remove"} or not valid_name(name): raise ValueError("invalid host operation")
+        old = readhosts(); target = dict(old)
+        if operation == "add":
+            if name in old: raise ValueError("host already exists; remove it before enrolling again")
+            target[name] = digest[0]
+        else: target.pop(name, None)
+        validate_hosts(target)
+        write(pending, {"op":operation, "name":name, "old":old, "target":target,
+            "at":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")})
+    elif act == "field": print(readpending()[args[0]])
+    elif act == "enrollment":
+        transaction = readpending()
+        print(json.dumps({"at":transaction["at"], "enabled":True, "enrollment":transaction["target"][transaction["name"]]}, separators=(",", ":")))
+    elif act == "commit": write(hosts, readpending()["target"])
+    elif act == "restore": write(hosts, readpending()["old"])
+    elif act == "clear":
+        check(pending); pending.unlink(); syncdir()
+    elif act == "secret-present":
+        value = json.load(sys.stdin)
+        if not isinstance(value, list) or any(not isinstance(v, dict) or not isinstance(v.get("name"), str) for v in value):
+            raise ValueError("unexpected Wrangler secret list response")
+        print("yes" if any(v["name"] == args[0] for v in value) else "no")
+    elif act in ("status", "alert"):
+        token = sys.stdin.read()
+        if not token or any(c in token for c in "\r\n"): raise ValueError("invalid authentication token")
+        base = args[0].rstrip("/")
+        def request(path, post=False):
+            config = "header = " + json.dumps("Authorization: Bearer " + token) + "\n"
+            cmd = ["curl", "-q", "--config", "-", "-fsS", "--connect-timeout", "10", "--max-time", "60"]
+            if post: cmd += ["-X", "POST", "-H", "Content-Type: application/json", "--data", json.dumps({"memo":"(test) tattle test-alert", "channel":"test"})]
+            result = subprocess.run(cmd + [base + path], input=config, text=True, stdout=subprocess.PIPE, check=True)
+            return result.stdout
+        if act == "alert": request("/canary", True)
+        else:
+            import urllib.parse
+            cursor, cursors, allhosts = None, set(), {}
+            for page in range(1000):
+                path = "/hosts?pagination=1" + ("&cursor=" + urllib.parse.quote(cursor, safe="") if cursor else "")
+                value = json.loads(request(path))
+                if not isinstance(value, dict): raise ValueError("invalid hosts response")
+                # Paginated workers include cursor. Original workers return a
+                # complete {hosts} envelope; distinguish that envelope from a
+                # legacy host literally named "hosts" by the state values.
+                envelope = (set(value) <= {"hosts", "cursor"} and isinstance(value.get("hosts"), dict)
+                    and ("cursor" in value or all(isinstance(state, dict) for state in value["hosts"].values())))
+                if envelope:
+                    allhosts.update(value["hosts"])
+                    cursor = value.get("cursor")
+                else:
+                    # Also accept a bare host map from compatible older clients.
+                    if cursor is not None: raise ValueError("legacy hosts response during pagination")
+                    allhosts.update(value)
+                    cursor = None
+                if cursor is None or cursor == "": break
+                if not isinstance(cursor, str) or cursor in cursors: raise ValueError("invalid or repeated hosts cursor")
+                cursors.add(cursor)
+            else: raise ValueError("hosts pagination exceeded 1000 pages")
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for name, seen in sorted(allhosts.items()):
+                if not isinstance(seen, dict): raise ValueError("invalid host state response")
+                if "error" in seen:
+                    error = seen["error"]
+                    if not isinstance(error, str) or not error: raise ValueError("invalid host error response")
+                    error = " ".join("".join(c if c.isprintable() else " " for c in error).split())[:160] or "host state unavailable"
+                    print(f"{name:28} unavailable: {error}")
+                    continue
+                timestamp = seen.get("at")
+                if not isinstance(timestamp, str) or not timestamp: raise ValueError("invalid host timestamp")
+                at = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if at.tzinfo is None: raise ValueError("host timestamp must include timezone")
+                at = at.astimezone(datetime.timezone.utc)
+                if seen.get("status") == "awaiting-first-report":
+                    print(f"{name:28} awaiting first report since enrollment  {at:%Y-%m-%d %H:%M} UTC")
+                else:
+                    print(f"{name:28} {int((now-at).total_seconds() // 3600):>4}h ago  {at:%Y-%m-%d %H:%M} UTC")
+except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    # subprocess errors include argv, which intentionally contains no credentials.
+    print(f"tattle: {error}", file=sys.stderr); sys.exit(1)
+' "$py_action" "$DEPLOY" "$SECRETS" "$@"
 }
 
+load() {
+	py paths
+	[ -r "$SECRETS" ] || die "no $SECRETS; run tattle init"
+	# Deliberately trusted shell configuration; checked before sourcing.
+	. "$SECRETS"
+}
+cleanup_config() {
+	python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); root=pathlib.Path(sys.argv[2]); assert p.is_absolute() and p.parent == root and p.name.startswith(".tattle-wrangler-"); p.unlink()' "$config" "$ROOT/worker"
+}
+
+wr() {
+	if [ "$WRANGLER" = "$ROOT/worker/node_modules/.bin/wrangler" ] && [ ! -x "$WRANGLER" ]; then
+		die "project Wrangler missing; run: cd '$ROOT/worker' && npm ci"
+	fi
+	# A private temporary config beside src/ preserves Wrangler path resolution.
+	# Never replace or retain a shared working-tree wrangler.toml.
+	(
+		config=$(python3 -c '
+import os, pathlib, stat, sys, tempfile
+p, directory = map(pathlib.Path, sys.argv[1:])
+for path in (p, directory):
+    if not path.is_absolute() or path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise SystemExit("tattle: unsafe Wrangler config path")
+if not p.is_file() or p.stat().st_nlink != 1 or directory.stat().st_mode & 0o022:
+    raise SystemExit("tattle: unsafe Wrangler config or worker directory")
+fd, name = tempfile.mkstemp(prefix=".tattle-wrangler-", suffix=".toml", dir=directory)
+with os.fdopen(fd, "wb") as f: f.write(p.read_bytes())
+print(name)
+' "$DEPLOY/wrangler.toml" "$ROOT/worker") || exit 1
+		trap cleanup_config EXIT
+		trap 'exit 1' HUP INT TERM
+		cd "$ROOT/worker"
+		"$WRANGLER" --config "$config" "$@"
+	)
+}
 put_secret() { printf %s "$2" | wr secret put "$1" >/dev/null; }
+publish_map() { token_map=$(py map "$@") || return 1; put_secret HOST_TOKENS "$token_map"; }
+clear_optional() {
+	secret_list=$(wr secret list --format json) || return 1
+	present=$(printf %s "$secret_list" | py secret-present "$1") || return 1
+	if [ "$present" = yes ]; then printf 'y\n' | wr secret delete "$1" >/dev/null || return 1; fi
+}
+lock() {
+	mkdir "$LOCK" 2>/dev/null || die "deployment locked at $LOCK; if an operator was interrupted, confirm it has stopped and remove this empty lock directory before retrying"
+	trap 'rmdir "$LOCK"' EXIT
+	trap 'exit 1' HUP INT TERM
+}
+cleanup_host() {
+	for key in "expected/$1" "seen/$1" "last/$1"; do
+		wr kv key delete --binding STATE --remote "$key" >/dev/null || return 1
+	done
+}
+recover() {
+	[ -f "$PENDING" ] || return 0
+	pending_op=$(py field op) || return 1
+	pending_name=$(py field name) || return 1
+	if [ "$pending_op" = remove ]; then
+		publish_map target || return 1
+		cleanup_host "$pending_name" || return 1
+		py commit || return 1
+	elif [ "$pending_op" = add ]; then
+		# An interrupted add cannot disclose its token again. Revoke it and
+		# restore the previous map before allowing a fresh enrollment.
+		publish_map old || return 1
+		cleanup_host "$pending_name" || return 1
+		py restore || return 1
+	else
+		die "unknown pending operation; inspect $PENDING"
+	fi
+	py clear
+}
+validate_name() { py validate-name "$1"; }
 
 case "${1:-}" in
 init)
-	[ -e "$SECRETS" ] && die "$SECRETS already exists"
+	[ ! -e "$SECRETS" ] && [ ! -L "$SECRETS" ] || die "$SECRETS already exists"
 	mkdir -p "$(dirname "$SECRETS")"
-	umask 077
-	cat >"$SECRETS" <<EOF
-TATTLE_URL=https://tattle.<your-subdomain>.workers.dev
+	py paths
+	# noclobber prevents replacing a file created since validation.
+	(set -C; cat >"$SECRETS" <<EOF
+TATTLE_URL='https://tattle.<your-subdomain>.workers.dev'
 READ_TOKEN=$(rand)
 CANARY_KEY=$(rand)
 NTFY_URL=https://ntfy.sh/tattle-$(rand | cut -c1-24)
@@ -46,63 +264,76 @@ HEARTBEAT_URL=
 CANARY_EMAIL=
 NTFY_TOKEN=
 EOF
-	[ -f "$HOSTS" ] || echo '{}' >"$HOSTS"
+	)
+	py init-hosts
 	echo "wrote $SECRETS. Subscribe to the NTFY_URL topic in the ntfy app, set TATTLE_URL after the first deploy, then run tattle deploy."
 	;;
 deploy)
 	load
+	lock
+	# Validate private TOML and bundle the configured entrypoint before recovery
+	# can publish a token map or delete remote enrollment state.
+	python3 "$ROOT/bin/tattle-deploy-preflight.py" "$DEPLOY/wrangler.toml" || exit 1
+	wr deploy --dry-run || die "Wrangler deploy preflight failed; correct main, resource bindings, and module/rule configuration in $DEPLOY/wrangler.toml before retrying"
+	recover || die "pending transaction recovery failed; retry deploy"
 	wr deploy
-	put_secret HOST_TOKENS "$(hosts_json)"
+	publish_map
 	put_secret READ_TOKEN "$READ_TOKEN"
 	put_secret CANARY_KEY "$CANARY_KEY"
 	put_secret NTFY_URL "$NTFY_URL"
 	for opt in HEARTBEAT_URL CANARY_EMAIL NTFY_TOKEN; do
-		eval "v=\${$opt:-}"
-		[ -z "$v" ] || put_secret "$opt" "$v"
+		case "$opt" in
+		HEARTBEAT_URL) v=${HEARTBEAT_URL:-};;
+		CANARY_EMAIL) v=${CANARY_EMAIL:-};;
+		NTFY_TOKEN) v=${NTFY_TOKEN:-};;
+		esac
+		if [ -n "$v" ]; then put_secret "$opt" "$v"; else clear_optional "$opt"; fi
 	done
 	echo "deployed. Canary webhook: $TATTLE_URL/canary?key=<CANARY_KEY from $SECRETS>"
 	;;
 add-host)
 	load
 	name=${2:?usage: tattle add-host NAME}
-	echo "$name" | grep -Eq '^[a-z0-9][a-z0-9.-]*$' || die "host names are lowercase letters, digits, dots and dashes"
+	validate_name "$name"
+	lock
+	recover || die "pending transaction recovery failed; retry add-host"
 	token=$(rand)
-	python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d[sys.argv[2]]=sys.argv[3]; json.dump(d, open(p,"w"), indent=2, sort_keys=True)' "$HOSTS" "$name" "$(sha "$token")"
-	put_secret HOST_TOKENS "$(hosts_json)"
-	echo "Added $name. On that machine run:"
-	echo
-	echo "  curl -fsSL $TATTLE_URL/install.sh | sudo sh -s -- $token"
-	echo
-	echo "Add --no-canaries after the token to skip planting canaries."
-	echo
-	echo "The token is shown once. Commit $HOSTS (it holds only the hash)."
+	py begin add "$name" "$(sha "$token")"
+	enrollment=$(py enrollment)
+	if publish_map target && wr kv key put --binding STATE --remote "expected/$name" "$enrollment" >/dev/null && py commit; then
+		py clear
+	else
+		if ! recover; then echo "tattle: rollback pending in $PENDING; retry add-host or deploy to revoke the unpublished token" >&2; fi
+		die "host enrollment failed; no installation token issued"
+	fi
+	echo "Added $name. Save this token; it is shown once:"
+	printf '\n  %s\n\n' "$token"
+	echo "On that machine run, then paste the token when prompted:"
+	printf '\n  curl -fsSL %s/install.sh | sudo sh -s -- --prompt-token\n\n' "$TATTLE_URL"
+	echo "Add --no-canaries after --prompt-token to skip planting canaries."
+	echo "Commit $HOSTS (it holds only the hash)."
 	;;
 remove-host)
 	load
 	name=${2:?usage: tattle remove-host NAME}
-	python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.pop(sys.argv[2]); json.dump(d, open(p,"w"), indent=2, sort_keys=True)' "$HOSTS" "$name"
-	put_secret HOST_TOKENS "$(hosts_json)"
-	for k in "seen/$name" "last/$name"; do wr kv key delete --binding STATE --remote "$k" >/dev/null 2>&1 || true; done
+	validate_name "$name"
+	lock
+	recover || die "pending revocation/cleanup failed; retry remove-host"
+	py begin remove "$name"
+	recover || die "revocation/cleanup pending in $PENDING; retry remove-host $name"
 	echo "revoked $name (its stored reports are kept)"
 	;;
 status)
 	load
-	curl -fsS -H "Authorization: Bearer $READ_TOKEN" "$TATTLE_URL/hosts" | python3 -c '
-import json, sys, datetime
-hosts = json.load(sys.stdin)["hosts"]
-now = datetime.datetime.now(datetime.timezone.utc)
-for name, seen in sorted(hosts.items()):
-    at = datetime.datetime.fromisoformat(seen["at"].replace("Z", "+00:00"))
-    print(f"{name:28} {int((now - at).total_seconds() // 3600):>4}h ago  {at:%Y-%m-%d %H:%M} UTC")
-'
+	printf %s "$READ_TOKEN" | py status "$TATTLE_URL"
 	;;
 test-alert)
 	load
-	curl -fsS -X POST "$TATTLE_URL/canary?key=$CANARY_KEY" -d '{"memo":"(test) tattle test-alert","channel":"test"}' >/dev/null
+	printf %s "$CANARY_KEY" | py alert "$TATTLE_URL"
 	echo "sent; check your phone"
 	;;
 *)
-	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 	exit 1
 	;;
 esac

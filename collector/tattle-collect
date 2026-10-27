@@ -14,11 +14,18 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH LC_ALL=C
 
 VERSION=1
-[ -r /etc/tattle/env ] && . /etc/tattle/env
 
 OS=$(uname -s)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/tattle.XXXXXX") || exit 1
-trap 'rm -rf "$TMP"' EXIT INT TERM
+cleanup() {
+ trap - EXIT INT TERM
+ [ -z "${ACTIVE_JOB:-}" ] || kill_tree "$ACTIVE_JOB"
+ [ -z "${ACTIVE_READER:-}" ] || kill_tree "$ACTIVE_READER"
+ rm -rf "$TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -27,44 +34,187 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Group-writable is fine when the group is one whose members can sudo anyway.
 ADMIN_GID=0
 [ "$OS" = Darwin ] && ADMIN_GID=80
-trusted() {
-	for f in "$@"; do
-		[ -x "$f" ] || continue
-		d=$f ok=1
-		while [ "$d" != / ] && [ -n "$d" ]; do
-			[ -n "$(find "$d" -maxdepth 0 -user root ! -perm -002 \( ! -perm -020 -o -group 0 -o -group "$ADMIN_GID" \) 2>/dev/null)" ] || { ok=; break; }
-			d=$(dirname "$d")
-		done
-		[ -n "$ok" ] && { echo "$f"; return 0; }
-	done
-	return 1
+# Resolve one component at a time, checking both link locations and targets.
+# Validate POSIX ACL grants on Linux and reject macOS extended ACLs, whose
+# inherited allow/deny rights require a richer evaluator. Keep root/admin policy.
+secure_node() {
+ node=$1
+ [ "$(stat_owner "$node" 2>/dev/null)" = 0 ] || return 1
+ if [ ! -L "$node" ]; then
+  [ -n "$(find "$node" -maxdepth 0 ! -perm -002 \( ! -perm -020 -o -group 0 -o -group "$ADMIN_GID" \) 2>/dev/null)" ] || return 1
+ fi
+ if [ "$OS" = Linux ]; then
+  if have getfacl; then
+   acl=$(getfacl -cpn "$node" 2>/dev/null) || return 1
+   # Numeric named principals outside the root/admin policy must not be
+   # granted write, even if an ACL mask currently suppresses that grant.
+   printf '%s\n' "$acl" | awk -F: -v admin="$ADMIN_GID" '
+    !NF {next}
+    $1=="user" && $2!="" {if($2!=0 && $3~/w/) bad=1; next}
+    $1=="group" && $2!="" {if($2!=0 && $2!=admin && $3~/w/) bad=1; next}
+    /^(user::|group::|other::|mask::)/ {next}
+    {bad=1}
+    END {exit bad}' || return 1
+  elif [ ! -L "$node" ]; then
+   # POSIX ACL effective rights are capped by the group-class mode bits.
+   # Without an ACL reader, any group write bit is ambiguous, including
+   # an otherwise allowed root/admin group; non-writable masks are safe.
+   [ -n "$(find "$node" -maxdepth 0 ! -perm -020 2>/dev/null)" ] || return 1
+  fi
+ else
+  acl=$(ls -ldn "$node" 2>/dev/null) || return 1
+  case ${acl%% *} in *+*) return 1;; esac
+ fi
 }
+stat_owner() {
+ if [ "$OS" = Darwin ]; then stat -f %u "$1"; else stat -c %u "$1"; fi
+}
+resolve_trusted() (
+ requirement=$1; shift
+ for candidate in "$@"; do
+  case $candidate in /*) ;; *) continue;; esac
+  [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+  pending=${candidate#/} resolved= links=0 ok=1
+  secure_node / || continue
+  while [ -n "$pending" ]; do
+   part=${pending%%/*}
+   case $pending in */*) pending=${pending#*/};; *) pending=;; esac
+   case $part in ''|.) continue;; ..) resolved=${resolved%/*}; continue;; esac
+   node=$resolved/$part
+   [ -e "$node" ] || [ -L "$node" ] || { ok=; break; }
+   secure_node "$node" || { ok=; break; }
+   if [ -L "$node" ]; then
+    links=$((links + 1))
+    [ "$links" -le 40 ] || { ok=; break; }
+    target=$(readlink "$node" 2>/dev/null && printf '/') || { ok=; break; }
+    target=${target%/}
+    target=${target%"
+"} # readlink appends one newline
+    case $target in *"
+"*) ok=; break;; esac
+    case $target in /*) resolved=; target=${target#/};; esac
+    pending=$target${pending:+/$pending}
+   else
+    if [ -n "$pending" ] && [ ! -d "$node" ]; then ok=; break; fi
+    resolved=$node
+   fi
+  done
+  [ -n "$ok" ] && [ -f "$resolved" ] || continue
+  case $requirement in
+   executable) [ -x "$resolved" ] || continue;;
+   readable) [ -r "$resolved" ] || continue;;
+   *) exit 1;;
+  esac
+  printf '%s\n' "$resolved"; exit 0
+ done
+ exit 1
+)
+
+trusted() { resolve_trusted executable "$@"; }
+trusted_file() { resolve_trusted readable "$@"; }
+
+# Configuration contains shell assignments, so validate its canonical file and
+# every link/ancestor before sourcing it. Print mode never reads configuration.
+load_config() {
+ [ "$1" = --print ] && return 0
+ config=$(trusted_file "$2") || {
+  printf 'collector: missing or unsafe configuration: %s\n' "$2" >&2
+  return 1
+ }
+ . "$config"
+}
+
+# Load trusted configuration before collecting anything or locating helpers.
+load_config "${1:-}" /etc/tattle/env || exit 1
+
 TAILSCALE=$(trusted /usr/bin/tailscale /usr/sbin/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale /usr/local/bin/tailscale) || TAILSCALE=""
 LYNIS=$(trusted /usr/sbin/lynis /usr/bin/lynis /usr/local/bin/lynis) || LYNIS=""
 DOCKER=$(trusted /usr/bin/docker /usr/local/bin/docker) || DOCKER=""
 
-# Escape stdin as the body of a JSON string.
-# Escaping is done in sed, because awk implementations disagree about
-# backslashes in gsub replacements.
-TAB=$(printf '\t')
+# JSON escapes every non-ASCII byte as U+00xx. This preserves arbitrary
+# filesystem bytes reversibly (interpret those code points as bytes).
 jstr() {
-	tr -d '\000-\010\013-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" |
-		awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }'
+ od -An -v -tu1 | awk '{ for (i=1;i<=NF;i++) {
+  n=$i; if(n==34) printf "\\\""; else if(n==92) printf "\\\\";
+  else if(n==10) printf "\\n"; else if(n==9) printf "\\t";
+  else if(n>=32 && n<127) printf "%c",n; else printf "\\u%04x",n
+ } }'
 }
+# Hex encodes the complete path; no delimiter or character-set ambiguity.
+path_evidence() { printf 'path-hex:'; printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'; }
 
-# section NAME COMMAND...: run COMMAND, keep its output under NAME.
+# Each section has 30 seconds (Lynis: 180) and 16 KiB of raw output. Fourteen sections
+# expand to at most ~1.4 MiB even under worst-case JSON escaping (< 2 MiB).
+# A FIFO bounds disk usage even if a helper writes indefinitely.
+kill_tree() (
+ parent=$1
+ # BSD/GNU ps accepts -axo; BusyBox accepts the portable -o form.
+ # Discard partial output from failed probes and stay quiet if neither works.
+ snapshot=$(ps -axo pid=,ppid= 2>/dev/null) ||
+  snapshot=$(ps -o pid=,ppid= 2>/dev/null) || snapshot=
+ children=$(printf '%s\n' "$snapshot" |
+  awk -v p="$parent" '$1 ~ /^[0-9]+$/ && $2==p {print $1}')
+ for child in $children; do kill_tree "$child"; done
+ kill -TERM "$parent" 2>/dev/null || :
+ kill -KILL "$parent" 2>/dev/null || :
+)
 SECTIONS=""
 section() {
-	name=$1; shift
-	"$@" >"$TMP/$name" 2>/dev/null
-	SECTIONS="$SECTIONS $name"
+ name=$1; shift
+ mkfifo "$TMP/$name.pipe" || exit 1
+ : >"$TMP/$name.raw"
+ ( head -c 16385 <"$TMP/$name.pipe" >"$TMP/$name.raw"; : >"$TMP/$name.read-done" ) &
+ reader=$!
+ ( "$@"; result=$?; printf '%s\n' "$result" >"$TMP/$name.status" ) >"$TMP/$name.pipe" 2>/dev/null &
+ job=$! elapsed=0 reason= limit=30
+ ACTIVE_JOB=$job ACTIVE_READER=$reader
+ case $name in lynis) limit=180;; esac
+ while [ ! -f "$TMP/$name.status" ]; do
+  bytes=$(wc -c <"$TMP/$name.raw")
+  if [ "$bytes" -gt 16384 ]; then reason=truncated; break; fi
+  if [ "$elapsed" -ge "$limit" ]; then reason=timeout; break; fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+ done
+ # Also stop descendants left running by a helper that returned early.
+ kill_tree "$job"
+ wait "$job" 2>/dev/null || :
+ # Let the bounded reader drain bytes already written before stopping it.
+ drain=0
+ while [ ! -f "$TMP/$name.read-done" ] && [ "$drain" -lt 2 ]; do
+  sleep 1; drain=$((drain + 1))
+ done
+ kill_tree "$reader"
+ wait "$reader" 2>/dev/null || :
+ ACTIVE_JOB= ACTIVE_READER=
+ head -c 16384 "$TMP/$name.raw" >"$TMP/$name"
+ [ "$(wc -c <"$TMP/$name.raw")" -le 16384 ] || reason=truncated
+ if [ -n "$reason" ]; then printf '\n[collector: %s]\n' "$reason" >>"$TMP/$name"
+ elif [ "$(cat "$TMP/$name.status")" != 0 ]; then
+  printf '\n[collector: failure exit=%s]\n' "$(cat "$TMP/$name.status")" >>"$TMP/$name"
+ fi
+ SECTIONS="$SECTIONS $name"
+}
+
+# Pass homes as quoted arguments. macOS glob expansion preserves each pathname;
+# passwd records cannot contain newlines, and read preserves spaces and globs.
+with_homes() {
+ callback=$1
+ if [ "$OS" = Darwin ]; then
+  for home in /var/root /Users/*; do
+   [ "$home" = /Users/Shared ] || "$callback" "$home"
+  done
+ else
+  awk -F: '$3 == 0 || $3 >= 1000 { print $6 }' /etc/passwd | sort -u |
+   while IFS= read -r home; do "$callback" "$home"; done
+ fi
 }
 
 ssh_keys() {
 	for home in "$@"; do
 		for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
 			[ -f "$f" ] || continue
-			ssh-keygen -lf "$f" 2>/dev/null | awk -v u="${home##*/}" '{ print u, $1, $2, $NF }'
+			ssh-keygen -lf "$f" 2>/dev/null | awk -v u="$(path_evidence "$home")" '{ print u, $1, $2, $NF }'
 		done
 	done
 }
@@ -74,12 +224,12 @@ unprotected_keys() {
 	for home in "$@"; do
 		for f in "$home"/.ssh/*; do
 			[ -f "$f" ] && head -c 40 "$f" 2>/dev/null | grep -q 'PRIVATE KEY' || continue
-			ssh-keygen -y -P "" -f "$f" >/dev/null 2>&1 && echo "unprotected-key: ${home##*/} ${f#$home/}"
+			ssh-keygen -y -P "" -f "$f" >/dev/null 2>&1 && printf 'unprotected-key: %s\n' "$(path_evidence "$f")"
 		done
 		# Fingerprints of this machine's own keys: joined with other machines'
 		# authorized_keys, they show which machine can log into which.
 		for f in "$home"/.ssh/*.pub; do
-			[ -f "$f" ] && ssh-keygen -lf "$f" 2>/dev/null | awk -v u="${home##*/}" '{ print "own-key:", u, $2 }'
+			[ -f "$f" ] && ssh-keygen -lf "$f" 2>/dev/null | awk -v u="$(path_evidence "$home")" '{ print "own-key:", u, $2 }'
 		done
 	done
 }
@@ -94,23 +244,45 @@ credential_files() {
 			f="$home/$rel"
 			[ -e "$f" ] || continue
 			if [ "$OS" = Darwin ]; then m=$(stat -f %Lp "$f"); else m=$(stat -c %a "$f"); fi
-			echo "${home##*/} ~/$rel mode $m"
+			printf 'credential: %s mode %s\n' "$(path_evidence "$f")" "$m"
 		done
 	done
 }
 
 # App secrets other accounts can read, and data dumps left in home directories.
 # Paths, modes and sizes only, never contents.
+# find passes each filename as an argument, including newlines and invalid
+# bytes. The helper emits a hex path independently of tool filename formatting.
+cat >"$TMP/path-record" <<'PATH_RECORD'
+#!/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C
+kind=$1; shift
+for f do
+ [ -f "$f" ] || continue
+ printf '%s path-hex:' "$kind"
+ printf '%s' "$f" | od -An -v -tx1 | tr -d ' \n'
+ case $kind in
+  world-readable) printf ' mode %s' "$(stat -c %a "$f")";;
+  data-dump) printf ' bytes %s' "$(stat -c %s "$f")";;
+  *)
+   if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum <"$f"); else h=$(shasum -a 256 <"$f"); fi
+   printf ' sha256 %.16s' "$h";;
+ esac
+ printf '\n'
+done
+PATH_RECORD
+chmod 700 "$TMP/path-record"
 linux_loose_files() {
-	for home in "$@"; do
-		[ "$home" = / ] && continue
-		find "$home" -xdev -maxdepth 4 -name node_modules -prune -o -type f \
-			\( -name .env -o -name '.env.*' -o -name '*.env' -o -name application.yml -o -name .asdf-vars \) \
-			-perm -004 -print 2>/dev/null | while read -r f; do echo "world-readable: $f mode $(stat -c %a "$f")"; done
-		find "$home" -xdev -maxdepth 3 -name node_modules -prune -o -type f \
-			\( -name '*.sql' -o -name '*.sql.gz' -o -name '*.dump' -o -name '*backup*.json' \) \
-			-size +1M -print 2>/dev/null | while read -r f; do echo "data-dump: $f $(du -h "$f" | cut -f1)"; done
-	done
+ for home in "$@"; do
+  [ "$home" = / ] && continue
+  find "$home" -xdev -maxdepth 4 -name node_modules -prune -o -type f \
+   \( -name .env -o -name '.env.*' -o -name '*.env' -o -name application.yml -o -name .asdf-vars \) \
+   -perm -004 -exec "$TMP/path-record" world-readable {} + 2>/dev/null
+  find "$home" -xdev -maxdepth 3 -name node_modules -prune -o -type f \
+   \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.dump' -o -name '*backup*.json' \) \
+   -size +1M -exec "$TMP/path-record" data-dump {} + 2>/dev/null
+ done
 }
 
 tailscale_exposure() {
@@ -118,14 +290,6 @@ tailscale_exposure() {
 	[ -n "$ts" ] || return 0
 	"$ts" serve status 2>/dev/null | grep -E 'https?://|tcp://|proxy|path' | sed 's/^ */serve: /'
 	"$ts" funnel status 2>/dev/null | grep -iE 'funnel on|https://' | sed 's/^ */funnel: /'
-}
-
-home_dirs() {
-	if [ "$OS" = Darwin ]; then
-		ls -d /var/root /Users/* 2>/dev/null | grep -v /Users/Shared
-	else
-		awk -F: '$3 == 0 || $3 >= 1000 { print $6 }' /etc/passwd | sort -u
-	fi
 }
 
 # ---------------------------------------------------------------- macOS
@@ -147,8 +311,8 @@ mac_accounts() {
 
 mac_ssh() {
 	echo "remote-login: $(systemsetup -getremotelogin 2>/dev/null | cut -d: -f2)"
-	ssh_keys $(home_dirs)
-	unprotected_keys $(home_dirs)
+	with_homes ssh_keys
+	with_homes unprotected_keys
 }
 
 mac_exposure() {
@@ -168,13 +332,29 @@ mac_listening() {
 	lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $1, $3, $9 }' | sort -u
 }
 
+# Cron commands and environment assignments may embed credentials. Hash only
+# normalized active lines, emitting their count and account identity. Counting
+# and hashing share one stream, so no command text is retained in scratch files.
+mac_cron_metadata() {
+ user=$1
+ digest=$(crontab -u "$user" -l 2>/dev/null |
+  TATTLE_CRON_COUNT="$TMP/cron.count" awk '
+   {sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "")}
+   $0 !~ /^#/ && length {print; count++}
+   END {print count+0 > ENVIRON["TATTLE_CRON_COUNT"]}' |
+  shasum -a 256 | cut -d' ' -f1)
+ printf 'cron user-hex:%s entries:%s sha256:%s\n' \
+  "$(printf '%s' "$user" | od -An -v -tx1 | tr -d ' \n')" \
+  "$(cat "$TMP/cron.count")" "$digest"
+}
+
 mac_persistence() {
 	for d in /Library/LaunchDaemons /Library/LaunchAgents /Users/*/Library/LaunchAgents; do
 		[ -d "$d" ] || continue
-		find "$d" -maxdepth 1 -name '*.plist' -type f -exec shasum -a 256 {} + 2>/dev/null
-	done | awk '{ print substr($1, 1, 16), $2 }' | sort -k2
+		find "$d" -maxdepth 1 -name '*.plist' -type f -exec "$TMP/path-record" launch {} + 2>/dev/null
+	done | sort
 	for u in $(dscl . -list /Users UniqueID | awk '$2 >= 500 { print $1 }'); do
-		crontab -u "$u" -l 2>/dev/null | grep -v '^#' | sed "s/^/cron $u: /"
+		mac_cron_metadata "$u"
 	done
 	profiles list -all 2>/dev/null | grep -i 'profileIdentifier' | sed 's/^.*profileIdentifier: */profile: /'
 	[ -f /etc/sudoers ] && echo "sudoers $(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | shasum -a 256 | cut -c1-16)"
@@ -198,7 +378,7 @@ mac_packages() {
 	for app in /Applications/*.app /Applications/*/*.app; do
 		[ -d "$app" ] || continue
 		v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null)
-		echo "${app#/Applications/} $v"
+		printf '%s version %s\n' "$(path_evidence "$app")" "$v"
 	done
 	user=$(stat -f%Su /dev/console)
 	if [ "$user" != root ] && [ -x /opt/homebrew/bin/brew ]; then
@@ -235,8 +415,8 @@ linux_accounts() {
 
 linux_ssh() {
 	have sshd && sshd -T 2>/dev/null | grep -E '^(port|listenaddress|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile|allowtcpforwarding|allowagentforwarding|x11forwarding|gatewayports) '
-	ssh_keys $(home_dirs)
-	unprotected_keys $(home_dirs)
+	with_homes ssh_keys
+	with_homes unprotected_keys
 }
 
 linux_exposure() {
@@ -253,11 +433,10 @@ linux_listening() {
 linux_persistence() {
 	systemctl list-unit-files --state=enabled --no-legend 2>/dev/null | awk '{ print "enabled:", $1 }'
 	# Units an admin (or intruder) wrote, as opposed to ones a package shipped.
-	find /etc/systemd/system -name '*.service' -o -name '*.timer' 2>/dev/null | while read -r f; do
-		[ -f "$f" ] && echo "unit $(sha256sum "$f" | cut -c1-16) $f"
-	done
-	find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /var/spool/cron -type f 2>/dev/null \
-		-exec sha256sum {} + | awk '{ print "cron", substr($1, 1, 16), $2 }'
+ find /etc/systemd/system \( -name '*.service' -o -name '*.timer' \) -type f \
+  -exec "$TMP/path-record" unit {} + 2>/dev/null
+ find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /var/spool/cron -type f \
+  -exec "$TMP/path-record" cron {} + 2>/dev/null
 	[ -s /etc/ld.so.preload ] && sed 's/^/ld.so.preload: /' /etc/ld.so.preload
 	[ -f /etc/rc.local ] && echo "rc.local $(sha256sum /etc/rc.local | cut -c1-16)"
 	echo "sudoers $(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | sha256sum | cut -c1-16)"
@@ -308,7 +487,7 @@ if [ "$OS" = Darwin ]; then
 	section posture mac_posture
 	section exposure mac_exposure
 	section updates mac_updates
-	section credentials credential_files $(home_dirs)
+	section credentials with_homes credential_files
 	section packages mac_packages
 	section tailscale tailscale_peers
 else
@@ -320,8 +499,8 @@ else
 	section posture linux_posture
 	section updates linux_updates
 	section exposure linux_exposure
-	section credentials credential_files $(home_dirs)
-	section files linux_loose_files $(home_dirs)
+	section credentials with_homes credential_files
+	section files with_homes linux_loose_files
 	section containers linux_containers
 	section packages linux_packages
 	section tailscale tailscale_peers
@@ -340,6 +519,8 @@ fi
 	done
 	printf '}}\n'
 } >"$TMP/report.json"
+# Defense in depth if future sections or limits change.
+[ "$(wc -c <"$TMP/report.json")" -lt 2097152 ] || { echo "collector: report exceeds ingestion limit" >&2; exit 1; }
 
 if [ "${1:-}" = --print ]; then
 	cat "$TMP/report.json"
