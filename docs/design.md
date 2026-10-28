@@ -29,9 +29,9 @@ machine can reach.
  ┌──────────────────────┐   POST     ┌──────────────────────┐
  │ collector (launchd / │──────────▶ │ Worker: /ingest       │
  │ systemd timer, daily)│ per-host   │  write-once to R2     │
- └──────────────────────┘  token     │  diff vs last report  │──▶ ntfy ──▶ phone
-                                     │ cron: missed check-in │──▶ ntfy
- canarytokens.org ── trip ─────────▶ │ /canary               │──▶ ntfy (max priority)
+ └──────────────────────┘  token     │  diff vs last report  │──▶ email
+                                     │ cron: missed check-in │──▶ email
+ canarytokens.org ── trip ─────────▶ │ /canary               │──▶ email + ntfy ──▶ phone
                                      └──────────┬───────────┘
                                                 │ read-only token
                                      ┌──────────▼───────────┐
@@ -81,8 +81,10 @@ gzipped and posted to `/ingest`.
   alert, then one reminder a day until it reports again. If `HEARTBEAT_URL` is
   set, each cron run pings it, so an outside dead-man's switch notices if the
   worker itself is deleted.
-- `POST /canary?key=…` receives canarytokens.org webhooks and alerts at max
-  priority.
+- `POST /canary?key=…` receives canarytokens.org webhooks and alerts by email
+  and by ntfy push at max priority. Canary trips are the only alerts sent to the
+  phone, because they are the only ones that need an answer within minutes.
+  Without email configured, every alert goes to ntfy.
 - `GET /install.sh`, `GET /tattle-collect`: the installer and collector, served
   from this repo so every machine runs the version you deployed.
 - `GET /canaries.sh` (host token): mints canaries for that host and returns a

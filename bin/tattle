@@ -6,7 +6,7 @@
 #   tattle add-host NAME        mint a host token, print the install command
 #   tattle remove-host NAME     revoke a host's token
 #   tattle status               last report time for every host
-#   tattle test-alert           send a test notification through the worker's ntfy topic
+#   tattle test-alert           send a test alert (email, plus phone push if ntfy is set up)
 #
 # State lives in two places, deliberately apart:
 #   $TATTLE_DEPLOY  (a private git repo)  wrangler.toml, hosts.json (token hashes only)
@@ -99,7 +99,7 @@ for name, seen in sorted(hosts.items()):
 test-alert)
 	load
 	curl -fsS -X POST "$TATTLE_URL/canary?key=$CANARY_KEY" -d '{"memo":"(test) tattle test-alert","channel":"test"}' >/dev/null
-	echo "sent; check your phone"
+	echo "sent; check your email and phone"
 	;;
 *)
 	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'

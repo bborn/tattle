@@ -63,3 +63,13 @@ test("plantScript refuses blank canary values", () => {
 	const aws = { aws_access_key_id: "", aws_secret_access_key: "x" };
 	assert.throws(() => plantScript({ aws, envFile: aws, dns: { hostname: "h.example" } }));
 });
+
+test("alertMime builds a plain-text message with an encoded subject", async () => {
+	const { alertMime } = await import("../src/email.js");
+	const raw = alertMime({ from: "tattle@example.com", to: "a@example.org", subject: "box: 2 changes\nX-Injected: 1", body: "new admin: mallory", id: "abc" });
+	assert.match(raw, /^From: tattle <tattle@example.com>\r\n/);
+	assert.match(raw, /\r\nMessage-ID: <abc@example.com>\r\n/);
+	assert.doesNotMatch(raw, /\r\nX-Injected/);
+	const [, body] = raw.split("\r\n\r\n");
+	assert.equal(Buffer.from(body, "base64").toString(), "new admin: mallory");
+});

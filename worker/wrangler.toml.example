@@ -10,6 +10,15 @@ crons = ["17 * * * *"]   # hourly missed-check-in sweep
 
 [vars]
 STALE_HOURS = "36"
+# Email alerts (optional, recommended). The From address must be on a domain
+# that uses Cloudflare Email Routing in this account, and the To address must be
+# a verified destination address there. Without these, every alert goes to ntfy.
+ALERT_EMAIL_FROM = "tattle@<your domain>"
+ALERT_EMAIL_TO = "<you>@example.com"
+
+[[send_email]]
+name = "EMAIL"
+destination_address = "<you>@example.com"
 
 [[r2_buckets]]
 binding = "REPORTS"

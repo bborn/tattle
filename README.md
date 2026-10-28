@@ -13,19 +13,20 @@ attacker can't reach, and it points out what one compromised machine could get t
   permissions and Tailscale exposure.
 - **Off-box diff.** The snapshot goes straight to a Cloudflare Worker you own,
   into an R2 bucket the machine can write to but can't read, change or delete.
-  The Worker compares it with the previous day's and sends a phone alert through
-  ntfy when something security-relevant changes: a new admin, a new SSH key, a
+  The Worker compares it with the previous day's and emails you when something
+  security-relevant changes: a new admin, a new SSH key, a
   new launch daemon, a process newly open to the network, FileVault or the
   firewall turned off.
 - **Silence alerts.** If a machine stops reporting for 36 hours, you get an alert.
   An attacker who disables the collector can't make that alert go away.
 - **Canaries.** At install, tattle plants fake AWS keys and a fake SSH host in
   each user's home directory, using free canarytokens.org tokens. Nobody
-  legitimate ever uses them, so if one is used you get a max-priority alert naming
-  the machine and the file, usually within seconds.
+  legitimate ever uses them, so if one is used you get an email and a phone push
+  naming the machine and the file, usually within seconds. Canary trips are the
+  only alerts that go to your phone.
 
-Everything runs on free tiers: Cloudflare Workers, R2 and KV, ntfy.sh and
-canarytokens.org. There is no agent to install beyond one POSIX shell script, and
+Everything runs on free tiers: Cloudflare Workers, R2, KV and Email Routing,
+ntfy.sh and canarytokens.org. There is no agent to install beyond one POSIX shell script, and
 no AI runs on the monitored machines.
 
 See [docs/design.md](docs/design.md) for how it works and why, and
@@ -37,7 +38,11 @@ reduce blast radius. Most of them came up in real audits of real machines.
 - A Cloudflare account. **Use a new one that you use for nothing else**, and keep
   its credentials off every machine you monitor. Anyone with a `wrangler` login to
   the monitoring account can delete the Worker and silence every alert.
-- The [ntfy](https://ntfy.sh) app on your phone.
+- A domain on that account with Email Routing turned on, so tattle has an
+  address to send from, and your own address added there as a verified
+  destination. That's where alerts will go.
+- The [ntfy](https://ntfy.sh) app on your phone and a free ntfy.sh account, for
+  canary pushes.
 - Node.js (for `npx wrangler`), `python3` and `curl` on the machine you operate
   from.
 - Optional: a free [healthchecks.io](https://healthchecks.io) check, to alert you
@@ -63,17 +68,18 @@ npx wrangler kv namespace create STATE    # note the id it prints
 
 # 2. Worker config
 cp worker/wrangler.toml.example "$TATTLE_DEPLOY/wrangler.toml"
-# edit it: put the KV namespace id in
+# edit it: put the KV namespace id and your email addresses in
 
 # 3. Secrets, then deploy
 bin/tattle init        # writes ~/.config/tattle/secrets.env (read token, canary key, ntfy topic)
+# in the ntfy.sh web app, create an access token and put it in NTFY_TOKEN
 bin/tattle deploy      # prints the Worker URL
 # put that URL in TATTLE_URL in ~/.config/tattle/secrets.env
 ```
 
-Subscribe to the `NTFY_URL` topic from `secrets.env` in the ntfy app. The topic
-name is the only thing protecting your alerts, so keep it secret. Then check the
-path end to end:
+Subscribe to the `NTFY_URL` topic from `secrets.env` in the ntfy app. Keep the
+topic name secret: anyone who knows it can read and send to it. Then check both
+channels end to end. You should get an email and a push:
 
 ```sh
 bin/tattle test-alert
@@ -113,7 +119,8 @@ bin/tattle status              # when each machine last reported
 bin/tattle remove-host NAME    # revoke a machine's token
 ```
 
-Alerts you can expect:
+Alerts you can expect. All of them are emailed, and canary trips also go to your
+phone. If email isn't configured, everything goes to ntfy instead.
 
 | alert | priority | meaning |
 |---|---|---|
@@ -137,8 +144,11 @@ you want to feed them to something else.
 - iPhones and iPads can't run the collector. Keep them updated, and use Lockdown
   Mode for anyone at higher risk.
 - ntfy.sh topics are public to anyone who knows the name. Use the long random
-  name `tattle init` generates, or reserve a topic or run your own ntfy server
-  and set `NTFY_TOKEN`.
+  name `tattle init` generates, or run your own ntfy server.
+- ntfy.sh limits anonymous senders by IP address, and Cloudflare Workers share
+  their IP addresses with everyone else's Workers, so anonymous pushes from the
+  Worker often fail on the daily quota. Set `NTFY_TOKEN` from a free ntfy.sh
+  account so the quota is yours alone.
 - Each machine can report at most once an hour, so one compromised machine
   can't use up the free-tier quotas the other machines' alerts depend on.
 - The install command puts the host token on the command line once, so it can

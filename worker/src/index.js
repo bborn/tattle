@@ -7,7 +7,11 @@
 //   HOST_TOKENS secret, JSON {"<sha256 hex of token>": "<host name>", ...}
 //   READ_TOKEN  secret, bearer token for GET /reports (the analyzer)
 //   CANARY_KEY  secret, shared key in the canary webhook URL
-//   NTFY_URL    secret, e.g. https://ntfy.sh/<long random topic>
+//   EMAIL       optional send_email binding, with vars ALERT_EMAIL_FROM (an
+//               address on a domain using Cloudflare Email Routing) and
+//               ALERT_EMAIL_TO (a verified destination). Gets every alert.
+//   NTFY_URL    secret, e.g. https://ntfy.sh/<long random topic>. Gets canary
+//               trips, or every alert when email isn't configured.
 //   STALE_HOURS var, default 36
 //   HEARTBEAT_URL optional secret: pinged every cron run, so an outside
 //               dead-man's switch (e.g. healthchecks.io) notices if this
@@ -20,6 +24,7 @@ import collectorScript from "../../collector/tattle-collect";
 import installScript from "../../collector/install.sh";
 import { diffSections } from "./diff.js";
 import { mintCanaries, plantScript } from "./canaries.js";
+import { alertMime } from "./email.js";
 
 const MAX_BODY = 2 * 1024 * 1024; // decompressed
 const MIN_INTERVAL_MS = 3600 * 1000; // one report per host per hour
@@ -167,7 +172,7 @@ async function canary(request, env, url) {
 	}
 	// canarytokens.org pings every new webhook once to prove it works.
 	if (/newly saved webhook works/i.test(memo)) return new Response("ok\n");
-	await notify(env, `CANARY TRIPPED ${memo}`.trim(), detail || "A canary token was used.", { priority: 5, tags: "rotating_light" });
+	await notify(env, `CANARY TRIPPED ${memo}`.trim(), detail || "A canary token was used.", { priority: 5, tags: "rotating_light", push: true });
 	return new Response("ok\n");
 }
 
@@ -254,12 +259,30 @@ function timingSafeEqual(a, b) {
 	return diff === 0;
 }
 
-async function notify(env, title, message, { priority = 3, tags = "" } = {}) {
-	if (!env.NTFY_URL) return console.log("ntfy not configured:", title, message);
+// Every alert goes to email when it is configured. Phone push (ntfy) is kept
+// for canary trips, which are the only alerts worth interrupting someone for,
+// and is the fallback for everything when email isn't set up.
+async function notify(env, title, message, { priority = 3, tags = "", push = false } = {}) {
+	const email = Boolean(env.EMAIL && env.ALERT_EMAIL_FROM && env.ALERT_EMAIL_TO);
+	const sends = [];
+	if (email) sends.push(sendEmail(env, title, message));
+	if (env.NTFY_URL && (push || !email)) sends.push(sendPush(env, title, message, priority, tags));
+	if (!sends.length) return console.log("no alert channel configured:", title, message);
+	// Throw if any channel failed, so the caller's request fails and gets
+	// retried instead of the alert being lost.
+	const failed = (await Promise.allSettled(sends)).filter((r) => r.status === "rejected");
+	if (failed.length) throw new Error(failed.map((r) => r.reason?.message || r.reason).join("; "));
+}
+
+async function sendEmail(env, title, message) {
+	const { EmailMessage } = await import("cloudflare:email");
+	const raw = alertMime({ from: env.ALERT_EMAIL_FROM, to: env.ALERT_EMAIL_TO, subject: title, body: message });
+	await env.EMAIL.send(new EmailMessage(env.ALERT_EMAIL_FROM, env.ALERT_EMAIL_TO, raw));
+}
+
+async function sendPush(env, title, message, priority, tags) {
 	const headers = { Title: title.replace(/[\r\n]+/g, " ").slice(0, 200), Priority: String(priority), Tags: tags };
 	if (env.NTFY_TOKEN) headers.Authorization = `Bearer ${env.NTFY_TOKEN}`;
 	const res = await fetch(env.NTFY_URL, { method: "POST", body: message.slice(0, 3800), headers });
-	// Throw, so the caller's request fails and gets retried instead of the
-	// alert being lost.
 	if (!res.ok) throw new Error(`ntfy failed: ${res.status} ${await res.text()}`);
 }
