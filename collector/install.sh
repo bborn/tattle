@@ -99,8 +99,9 @@ if [ -n "$CANARIES" ]; then
 	PLANT=$(mktemp)
 	printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - "$URL/canaries.sh?user=$CUSER" -o "$PLANT"
 	sh -n "$PLANT"
-	chmod 644 "$PLANT"
-	if [ "$CUSER" = root ]; then HOME=$CHOME sh "$PLANT"; else sudo -u "$CUSER" HOME="$CHOME" sh "$PLANT"; fi
+	# Feed the script on stdin: root's temp directory isn't readable by the
+	# user, so the user's shell can't open the file itself.
+	if [ "$CUSER" = root ]; then HOME=$CHOME sh <"$PLANT"; else sudo -u "$CUSER" HOME="$CHOME" sh <"$PLANT"; fi
 	rm -f "$PLANT"
 fi
 }
