@@ -19,7 +19,7 @@ machine can reach.
    Collection is plain shell. The model that summarises reports gets read-only file
    access to copies of them, with no shell, network or credentials, because every
    byte it reads may have been written by an attacker.
-5. **Free.** Cloudflare free tier, ntfy.sh, canarytokens.org, open-source
+5. **Free.** Cloudflare free tier, canarytokens.org, open-source
    collectors.
 
 ## Components
@@ -31,7 +31,7 @@ machine can reach.
  │ systemd timer, daily)│ per-host   │  write-once to R2     │
  └──────────────────────┘  token     │  diff vs last report  │──▶ email
                                      │ cron: missed check-in │──▶ email
- canarytokens.org ── trip ─────────▶ │ /canary               │──▶ email + ntfy ──▶ phone
+ canarytokens.org ── trip ─────────▶ │ /canary               │──▶ email
                                      └──────────┬───────────┘
                                                 │ read-only token
                                      ┌──────────▼───────────┐
@@ -82,9 +82,9 @@ gzipped and posted to `/ingest`.
   set, each cron run pings it, so an outside dead-man's switch notices if the
   worker itself is deleted.
 - `POST /canary?key=…` receives canarytokens.org webhooks and alerts by email
-  and by ntfy push at max priority. Canary trips are the only alerts sent to the
-  phone, because they are the only ones that need an answer within minutes.
-  Without email configured, every alert goes to ntfy.
+  (and by ntfy push, if that is set up). ntfy is optional; without email it
+  takes every alert. An alert counts as delivered if any channel gets it
+  through. If every channel fails, the request fails too, so the sender retries.
 - `GET /install.sh`, `GET /tattle-collect`: the installer and collector, served
   from this repo so every machine runs the version you deployed.
 - `GET /canaries.sh` (host token): mints canaries for that host and returns a
@@ -124,5 +124,5 @@ backed-up machine cannot delete.
 ## Repo split
 
 - `tattle` (this repo, public): engine. No hostnames, tokens or findings.
-- a private deployment repo per operator: host list, token hashes, ntfy topic,
+- a private deployment repo per operator: host list, token hashes,
   findings and audit notes.

@@ -21,12 +21,11 @@ attacker can't reach, and it points out what one compromised machine could get t
   An attacker who disables the collector can't make that alert go away.
 - **Canaries.** At install, tattle plants fake AWS keys and a fake SSH host in
   each user's home directory, using free canarytokens.org tokens. Nobody
-  legitimate ever uses them, so if one is used you get an email and a phone push
-  naming the machine and the file, usually within seconds. Canary trips are the
-  only alerts that go to your phone.
+  legitimate ever uses them, so if one is used you get an email naming the
+  machine and the file, usually within seconds.
 
-Everything runs on free tiers: Cloudflare Workers, R2, KV and Email Routing,
-ntfy.sh and canarytokens.org. There is no agent to install beyond one POSIX shell script, and
+Everything runs on free tiers: Cloudflare Workers, R2, KV and Email Routing, and
+canarytokens.org. There is no agent to install beyond one POSIX shell script, and
 no AI runs on the monitored machines.
 
 See [docs/design.md](docs/design.md) for how it works and why, and
@@ -41,8 +40,6 @@ reduce blast radius. Most of them came up in real audits of real machines.
 - A domain on that account with Email Routing turned on, so tattle has an
   address to send from, and your own address added there as a verified
   destination. That's where alerts will go.
-- The [ntfy](https://ntfy.sh) app on your phone and a free ntfy.sh account, for
-  canary pushes.
 - Node.js (for `npx wrangler`), `python3` and `curl` on the machine you operate
   from.
 - Optional: a free [healthchecks.io](https://healthchecks.io) check, to alert you
@@ -71,15 +68,12 @@ cp worker/wrangler.toml.example "$TATTLE_DEPLOY/wrangler.toml"
 # edit it: put the KV namespace id and your email addresses in
 
 # 3. Secrets, then deploy
-bin/tattle init        # writes ~/.config/tattle/secrets.env (read token, canary key, ntfy topic)
-# in the ntfy.sh web app, create an access token and put it in NTFY_TOKEN
+bin/tattle init        # writes ~/.config/tattle/secrets.env (read token, canary key)
 bin/tattle deploy      # prints the Worker URL
 # put that URL in TATTLE_URL in ~/.config/tattle/secrets.env
 ```
 
-Subscribe to the `NTFY_URL` topic from `secrets.env` in the ntfy app. Keep the
-topic name secret: anyone who knows it can read and send to it. Then check both
-channels end to end. You should get an email and a push:
+Then check the alert path end to end. You should get an email:
 
 ```sh
 bin/tattle test-alert
@@ -119,8 +113,7 @@ bin/tattle status              # when each machine last reported
 bin/tattle remove-host NAME    # revoke a machine's token
 ```
 
-Alerts you can expect. All of them are emailed, and canary trips also go to your
-phone. If email isn't configured, everything goes to ntfy instead.
+Alerts you can expect (all by email):
 
 | alert | priority | meaning |
 |---|---|---|
@@ -143,12 +136,8 @@ you want to feed them to something else.
   a full EDR would catch.
 - iPhones and iPads can't run the collector. Keep them updated, and use Lockdown
   Mode for anyone at higher risk.
-- ntfy.sh topics are public to anyone who knows the name. Use the long random
-  name `tattle init` generates, or run your own ntfy server.
-- ntfy.sh limits anonymous senders by IP address, and Cloudflare Workers share
-  their IP addresses with everyone else's Workers, so anonymous pushes from the
-  Worker often fail on the daily quota. Set `NTFY_TOKEN` from a free ntfy.sh
-  account so the quota is yours alone.
+- Alerts go to one inbox. If you'd rather have canary trips on your phone too,
+  see "Phone push" below.
 - Each machine can report at most once an hour, so one compromised machine
   can't use up the free-tier quotas the other machines' alerts depend on.
 - The install command puts the host token on the command line once, so it can
@@ -156,6 +145,19 @@ you want to feed them to something else.
   reports as that machine, and `tattle remove-host` revokes it.
 - canarytokens.org is a free service run by Thinkst. If it is down, new canaries
   can't be minted and tripped ones may not alert.
+
+## Phone push (optional)
+
+Set `NTFY_URL` in `secrets.env` to an [ntfy](https://ntfy.sh) topic URL with a
+long random name and run `bin/tattle deploy`. Canary trips will then also go to
+that topic, and if email isn't configured, every alert will. If a push fails
+and the email gets through, the alert still counts as delivered.
+
+ntfy.sh limits anonymous senders by IP address, and Cloudflare Workers share
+their IP addresses with everyone else's Workers, so anonymous pushes from the
+Worker often fail on the daily quota. Make a free ntfy.sh account and add its
+access token as the `NTFY_TOKEN` secret so the quota is yours alone. Anyone who
+knows the topic name can read and send to it, so keep it secret.
 
 ## Development
 

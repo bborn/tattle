@@ -10,8 +10,8 @@
 //   EMAIL       optional send_email binding, with vars ALERT_EMAIL_FROM (an
 //               address on a domain using Cloudflare Email Routing) and
 //               ALERT_EMAIL_TO (a verified destination). Gets every alert.
-//   NTFY_URL    secret, e.g. https://ntfy.sh/<long random topic>. Gets canary
-//               trips, or every alert when email isn't configured.
+//   NTFY_URL    optional secret, e.g. https://ntfy.sh/<long random topic>.
+//               Gets canary trips, or every alert when email isn't configured.
 //   STALE_HOURS var, default 36
 //   HEARTBEAT_URL optional secret: pinged every cron run, so an outside
 //               dead-man's switch (e.g. healthchecks.io) notices if this
@@ -259,19 +259,21 @@ function timingSafeEqual(a, b) {
 	return diff === 0;
 }
 
-// Every alert goes to email when it is configured. Phone push (ntfy) is kept
-// for canary trips, which are the only alerts worth interrupting someone for,
-// and is the fallback for everything when email isn't set up.
+// Every alert goes to email when it is configured. ntfy is optional: if it is
+// set up, canary trips also go there as a phone push, and it takes every alert
+// when email isn't configured.
 async function notify(env, title, message, { priority = 3, tags = "", push = false } = {}) {
 	const email = Boolean(env.EMAIL && env.ALERT_EMAIL_FROM && env.ALERT_EMAIL_TO);
 	const sends = [];
 	if (email) sends.push(sendEmail(env, title, message));
 	if (env.NTFY_URL && (push || !email)) sends.push(sendPush(env, title, message, priority, tags));
 	if (!sends.length) return console.log("no alert channel configured:", title, message);
-	// Throw if any channel failed, so the caller's request fails and gets
-	// retried instead of the alert being lost.
-	const failed = (await Promise.allSettled(sends)).filter((r) => r.status === "rejected");
-	if (failed.length) throw new Error(failed.map((r) => r.reason?.message || r.reason).join("; "));
+	const results = await Promise.allSettled(sends);
+	const errors = results.filter((r) => r.status === "rejected").map((r) => r.reason?.message || String(r.reason));
+	// One channel getting through is enough. If none did, throw, so the
+	// caller's request fails and gets retried instead of the alert being lost.
+	if (errors.length === results.length) throw new Error(errors.join("; "));
+	for (const e of errors) console.error("alert channel failed:", e);
 }
 
 async function sendEmail(env, title, message) {

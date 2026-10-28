@@ -10,9 +10,9 @@ crons = ["17 * * * *"]   # hourly missed-check-in sweep
 
 [vars]
 STALE_HOURS = "36"
-# Email alerts (optional, recommended). The From address must be on a domain
-# that uses Cloudflare Email Routing in this account, and the To address must be
-# a verified destination address there. Without these, every alert goes to ntfy.
+# Email alerts. The From address must be on a domain that uses Cloudflare Email
+# Routing in this account, and the To address must be a verified destination
+# address there. If you leave these out, set NTFY_URL so alerts go to ntfy.
 ALERT_EMAIL_FROM = "tattle@<your domain>"
 ALERT_EMAIL_TO = "<you>@example.com"
 
@@ -28,7 +28,8 @@ bucket_name = "tattle-reports"
 binding = "STATE"
 id = "<kv namespace id>"
 
-# Secrets (wrangler secret put NAME): HOST_TOKENS, READ_TOKEN, CANARY_KEY, NTFY_URL
+# Secrets (wrangler secret put NAME): HOST_TOKENS, READ_TOKEN, CANARY_KEY.
+# Optional: NTFY_URL, NTFY_TOKEN, HEARTBEAT_URL, CANARY_EMAIL.
 
 # Serve the collector and installer as text, straight from the repo.
 [[rules]]

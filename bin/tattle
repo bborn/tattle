@@ -6,7 +6,7 @@
 #   tattle add-host NAME        mint a host token, print the install command
 #   tattle remove-host NAME     revoke a host's token
 #   tattle status               last report time for every host
-#   tattle test-alert           send a test alert (email, plus phone push if ntfy is set up)
+#   tattle test-alert           send a test alert through every configured channel
 #
 # State lives in two places, deliberately apart:
 #   $TATTLE_DEPLOY  (a private git repo)  wrangler.toml, hosts.json (token hashes only)
@@ -41,13 +41,13 @@ init)
 TATTLE_URL=https://tattle.<your-subdomain>.workers.dev
 READ_TOKEN=$(rand)
 CANARY_KEY=$(rand)
-NTFY_URL=https://ntfy.sh/tattle-$(rand | cut -c1-24)
+NTFY_URL=
 HEARTBEAT_URL=
 CANARY_EMAIL=
 NTFY_TOKEN=
 EOF
 	[ -f "$HOSTS" ] || echo '{}' >"$HOSTS"
-	echo "wrote $SECRETS. Subscribe to the NTFY_URL topic in the ntfy app, set TATTLE_URL after the first deploy, then run tattle deploy."
+	echo "wrote $SECRETS. Set TATTLE_URL after the first deploy, then run tattle deploy."
 	;;
 deploy)
 	load
@@ -55,8 +55,7 @@ deploy)
 	put_secret HOST_TOKENS "$(hosts_json)"
 	put_secret READ_TOKEN "$READ_TOKEN"
 	put_secret CANARY_KEY "$CANARY_KEY"
-	put_secret NTFY_URL "$NTFY_URL"
-	for opt in HEARTBEAT_URL CANARY_EMAIL NTFY_TOKEN; do
+	for opt in NTFY_URL HEARTBEAT_URL CANARY_EMAIL NTFY_TOKEN; do
 		eval "v=\${$opt:-}"
 		[ -z "$v" ] || put_secret "$opt" "$v"
 	done
@@ -99,7 +98,7 @@ for name, seen in sorted(hosts.items()):
 test-alert)
 	load
 	curl -fsS -X POST "$TATTLE_URL/canary?key=$CANARY_KEY" -d '{"memo":"(test) tattle test-alert","channel":"test"}' >/dev/null
-	echo "sent; check your email and phone"
+	echo "sent; check your email"
 	;;
 *)
 	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
