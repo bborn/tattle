@@ -38,3 +38,36 @@ export function diffSections(before, after) {
 	}
 	return out;
 }
+
+// Sections that flap: an app that isn't running when a snapshot is taken (just
+// after a reboot, say) drops out and then looks "new" the next day. For these,
+// anything a host has ever reported counts as already seen, so each listener or
+// launch agent alerts once. Persistence lines carry a content hash, so editing
+// a plist still alerts.
+export const REMEMBERED = ["persistence", "listening"];
+const KNOWN_CAP = 2000;
+
+// Previous sections with every line this host has ever reported folded in.
+export function withKnown(previous, known) {
+	const merged = { ...previous };
+	for (const name of REMEMBERED) {
+		const extra = (known && known[name]) || [];
+		if (extra.length) merged[name] = [String(previous[name] || ""), ...extra].filter(Boolean).join("\n");
+	}
+	return merged;
+}
+
+// The known set after adding this report's lines. Newest lines are kept when
+// the cap is hit, so something long gone can eventually alert again.
+export function rememberSeen(known, sections) {
+	const out = {};
+	for (const name of REMEMBERED) {
+		const set = new Set((known && known[name]) || []);
+		for (const line of String(sections[name] || "").split("\n").filter(Boolean)) {
+			set.delete(line);
+			set.add(line);
+		}
+		out[name] = [...set].slice(-KNOWN_CAP);
+	}
+	return out;
+}

@@ -22,7 +22,7 @@
 
 import collectorScript from "../../collector/tattle-collect";
 import installScript from "../../collector/install.sh";
-import { diffSections } from "./diff.js";
+import { diffSections, rememberSeen, withKnown } from "./diff.js";
 import { mintCanaries, plantScript } from "./canaries.js";
 import { alertMime } from "./email.js";
 
@@ -76,8 +76,9 @@ async function ingest(request, env) {
 	// Alert before saving the new baseline: if ntfy fails, this request fails,
 	// the collector retries, and the same change is found again.
 	const previous = await env.STATE.get(`last/${host}`, "json");
+	const known = (await env.STATE.get(`known/${host}`, "json")) || (previous ? rememberSeen(null, previous) : null);
 	if (previous) {
-		const findings = diffSections(previous, report.sections);
+		const findings = diffSections(withKnown(previous, known), report.sections);
 		if (findings.length) {
 			await notify(env, `${host}: ${findings.length} security-relevant change${findings.length > 1 ? "s" : ""}`, findings.slice(0, 20).join("\n"), {
 				priority: 4,
@@ -88,6 +89,7 @@ async function ingest(request, env) {
 	if (seen.staleAlertedAt) await notify(env, `${host} is reporting again`, "It had gone quiet.", { priority: 3, tags: "white_check_mark" });
 
 	await env.STATE.put(`last/${host}`, JSON.stringify(report.sections));
+	await env.STATE.put(`known/${host}`, JSON.stringify(rememberSeen(known, report.sections)));
 	await env.STATE.put(`seen/${host}`, JSON.stringify({ at: now.toISOString(), staleAlertedAt: null }));
 	return new Response("ok\n");
 }

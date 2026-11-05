@@ -73,3 +73,22 @@ test("alertMime builds a plain-text message with an encoded subject", async () =
 	const [, body] = raw.split("\r\n\r\n");
 	assert.equal(Buffer.from(body, "base64").toString(), "new admin: mallory");
 });
+
+import { rememberSeen, withKnown } from "../src/diff.js";
+
+test("a listener or launch agent that drops out and comes back does not alert again", () => {
+	const day1 = { ...base, listening: base.listening + "\nControlCe alice *:7000" };
+	const known = rememberSeen(rememberSeen(null, base), day1);
+	const day2 = { ...base }; // after a reboot, before ControlCenter and the agent are back
+	assert.deepEqual(diffSections(withKnown(day1, known), day2), []);
+	const known2 = rememberSeen(known, day2);
+	assert.deepEqual(diffSections(withKnown(day2, known2), day1), []);
+	const edited = { ...day1, persistence: "zzz /Library/LaunchDaemons/a.plist" };
+	assert.deepEqual(diffSections(withKnown(day1, known2), edited), ["+ persistence: zzz /Library/LaunchDaemons/a.plist"]);
+});
+
+test("accounts and ssh are not remembered: a removed key re-added still alerts", () => {
+	const withKey = { ...base, ssh: "remote-login: Off\nroot SHA256:xyz key" };
+	const known = rememberSeen(rememberSeen(null, withKey), base);
+	assert.deepEqual(diffSections(withKnown(base, known), withKey), ["+ ssh: root SHA256:xyz key"]);
+});
